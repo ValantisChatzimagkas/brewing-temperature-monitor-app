@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  influxdb:
+    image: influxdb:latest
+    container_name: influxdb
+    env_file:
+      - .env
+    ports:
+      - "8086:8086"  # InfluxDB Web UI and API
+    volumes:
+      - influxdb-data:/var/lib/influxdb
+    networks:
+      - influx-network
+
+volumes:
+  influxdb-data:
+    driver: local
+
+networks:
+  influx-network:
+    driver: bridge
