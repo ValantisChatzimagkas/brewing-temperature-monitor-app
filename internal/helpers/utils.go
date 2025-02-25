@@ -10,7 +10,7 @@ import (
 )
 
 // isInArray checks if an element is present
-func isInArray[T comparable](element T, array []T) bool {
+func IsInArray[T comparable](element T, array []T) bool {
 	for _, el := range array {
 		if element == el {
 			return true

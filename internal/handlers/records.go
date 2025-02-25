@@ -1,13 +1,13 @@
 package handlers
 
 import (
+	"brewing-temperature-monitor-app/internal/helpers"
 	"brewing-temperature-monitor-app/internal/models"
 	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
-
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -185,181 +185,31 @@ func (h *RecordHandler) GetDataFromDeviceByID(c *gin.Context) {
 		AggFreq: "1d",
 	}
 
-	// Bind query parameters to the struct
 	if err := c.ShouldBindQuery(&params); err != nil {
-		c.JSON(400, gin.H{"error": "Invalid query parameters"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid query parameters"})
 		return
 	}
 
-	// Validate input
-	if deviceId == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "deviceId parameter is required"})
-		return
-	}
-
-	query := ""
-	aggrFunctions := strings.Split(params.Aggr, ",")
-
-	switch {
-
-	// Start of case with no aggregations
-	case params.Aggr == "":
-		query += fmt.Sprintf(`
-			from(bucket: "`+h.Bucket+`")
+	var query string
+	if params.Aggr == "" {
+		query = fmt.Sprintf(`
+			from(bucket: "%s")
 			|> range(start: %s, stop: %s)
-			|> filter(fn: (r) => r._measurement == "sensor_data") 
+			|> filter(fn: (r) => r._measurement == "sensor_data")
 			|> filter(fn: (r) => r["device_id"] == "%s")
 			|> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-		`, params.Start, params.Stop, deviceId)
-
-		result, err := executeQuery(h, query, context.Background())
-		var records []map[string]interface{}
-
-		for result.Next() {
-			values := result.Record().Values()
-
-			record := map[string]interface{}{
-				"timestampSampled": values["_time"],
-				"deviceId":         values["device_id"],
-				"temperature":      values["temperature"],
-				"humidity":         values["humidity"],
-				"location":         values["location"],
-			}
-
-			records = append(records, record)
-		}
-
-		if err != nil {
-			log.Printf("Error querying data: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve data"})
-			return
-		}
-
-		if result.Err() != nil {
-			log.Printf("Query error: %v", result.Err())
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process data"})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{"data": records})
-		// End of case with no aggregations
-
-	// Start of case with only one aggregation
-	case params.Aggr != "" && len(aggrFunctions) == 1:
-		query += fmt.Sprintf(`
-		data = from(bucket: "`+h.Bucket+`")
-			|> range(start: %s, stop: %s)
-			|> filter(fn: (r) => r._measurement == "sensor_data") 
-			|> filter(fn: (r) => r["device_id"] == "%s")
-			|> filter(fn: (r) => r._field == "temperature" or r._field == "humidity")
-		%s_data = data |> aggregateWindow(every: %s, fn: %s, createEmpty: false)
-			|> set(key: "_aggregate", value: "%s")
-		renamed_data = %s_data
-			|> map(fn: (r) => ({ r with _field: "%s_${r._field}" }))
-		renamed_data
-			|> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-		`, params.Start, params.Stop, deviceId, aggrFunctions[0], params.AggFreq, aggrFunctions[0], aggrFunctions[0], aggrFunctions[0],
-			aggrFunctions[0],
-		)
-
-		result, err := executeQuery(h, query, context.Background())
-
-		var records []map[string]interface{}
-
-		for result.Next() {
-			values := result.Record().Values()
-
-			record := map[string]interface{}{
-				"timestamp": values["_time"],
-				"deviceId":  values["device_id"],
-				fmt.Sprintf("%s_temperature", aggrFunctions[0]): values[fmt.Sprintf("%s_temperature", aggrFunctions[0])],
-				fmt.Sprintf("%s_humidity", aggrFunctions[0]):    values[fmt.Sprintf("%s_humidity", aggrFunctions[0])],
-			}
-
-			records = append(records, record)
-		}
-
-		if err != nil {
-			log.Printf("Error querying data: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve data"})
-			return
-		}
-
-		if result.Err() != nil {
-			log.Printf("Query error: %v", result.Err())
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process data"})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{"data": records})
-		// End of case with only one aggregation
-
-		// Start of case with multiple aggregations
-	case params.Aggr != "" && len(aggrFunctions) > 1:
-		query += fmt.Sprintf(`
-		data = from(bucket: "`+h.Bucket+`")
-			|> range(start: %s, stop: %s)
-			|> filter(fn: (r) => r._measurement == "sensor_data") 
-			|> filter(fn: (r) => r["device_id"] == "%s")
-			|> filter(fn: (r) => r._field == "temperature" or r._field == "humidity")		
-		`, params.Start, params.Stop, deviceId,
-		)
-
-		for _, aggFunc := range aggrFunctions {
-			query += fmt.Sprintf(`
-		%s_data = data
-			|> aggregateWindow(every: %s, fn: %s, createEmpty: false)
-			|> set(key: "_aggregate", value: "%s")
-			|> map(fn: (r) => ({ r with _field: "%s_${r._field}" }))
-
-				`, aggFunc, params.AggFreq, aggFunc, aggFunc, aggFunc)
-		}
-		query += fmt.Sprintf(`
-		union(tables: [%s])
-    		|> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-		`, strings.Join(aggrFunctions, "_data,")+"_data")
-
-		result, err := executeQuery(h, query, context.Background())
-
-		var records []map[string]interface{}
-
-		for result.Next() {
-			values := result.Record().Values()
-			record := make(map[string]interface{})
-			record["timestamp"] = values["_time"]
-			record["deviceId"] = values["device_id"]
-
-			// Dynamically add fields based on the aggregation functions
-			for _, aggrFunc := range aggrFunctions {
-				for _, field := range []string{"temperature", "humidity"} {
-					key := fmt.Sprintf("%s_%s", aggrFunc, field)
-					record[key] = values[key]
-				}
-			}
-
-			records = append(records, record)
-		}
-
-		if err != nil {
-			log.Printf("Error querying data: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve data"})
-			return
-		}
-
-		if result.Err() != nil {
-			log.Printf("Query error: %v", result.Err())
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process data"})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{"data": records})
-
-		// End of case with multiple aggregations
-
-	default:
-		fmt.Printf("Error resovling aggregations: %v\n", aggrFunctions)
+		`, h.Bucket, params.Start, params.Stop, deviceId)
+	} else {
+		query = h.buildAggregatedQuery(deviceId, params)
 	}
 
+	records, err := h.executeAndProcessQuery(c, query)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve data"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": records})
 }
 
 // GetDataFromDeviceByLocation retrieves data for a specific location
@@ -437,6 +287,89 @@ func (h *RecordHandler) GetDataFromDeviceByLocation(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"data": records})
+}
+
+func (h *RecordHandler) buildAggregatedQuery(deviceID string, params QueryParams) string {
+	var queryBuilder strings.Builder
+
+	// Base query
+	queryBuilder.WriteString(fmt.Sprintf(`
+		data = from(bucket: "%s")
+			|> range(start: %s, stop: %s)
+			|> filter(fn: (r) => r._measurement == "sensor_data")
+			|> filter(fn: (r) => r["device_id"] == "%s")
+			|> filter(fn: (r) => r._field == "temperature" or r._field == "humidity")
+	`, h.Bucket, params.Start, params.Stop, deviceID))
+
+	aggrFunctions := strings.Split(params.Aggr, ",")
+
+	// Single aggregation case
+	if len(aggrFunctions) == 1 {
+		aggFunc := aggrFunctions[0]
+		queryBuilder.WriteString(fmt.Sprintf(`
+			%s_data = data
+				|> aggregateWindow(every: %s, fn: %s, createEmpty: false)
+				|> set(key: "_aggregate", value: "%s")
+				|> map(fn: (r) => ({ r with _field: "%s_${r._field}" }))
+			%s_data
+				|> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+		`, aggFunc, params.AggFreq, aggFunc, aggFunc, aggFunc, aggFunc))
+	} else {
+		// Multiple aggregations case
+		for _, aggFunc := range aggrFunctions {
+			queryBuilder.WriteString(fmt.Sprintf(`
+				%s_data = data
+					|> aggregateWindow(every: %s, fn: %s, createEmpty: false)
+					|> set(key: "_aggregate", value: "%s")
+					|> map(fn: (r) => ({ r with _field: "%s_${r._field}" }))
+			`, aggFunc, params.AggFreq, aggFunc, aggFunc, aggFunc))
+		}
+
+		queryBuilder.WriteString(fmt.Sprintf(`
+			union(tables: [%s])
+				|> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+		`, strings.Join(aggrFunctions, "_data,")+"_data"))
+	}
+
+	return queryBuilder.String()
+}
+
+func (h *RecordHandler) executeAndProcessQuery(c *gin.Context, query string) ([]map[string]interface{}, error) {
+	queryAPI := h.InfluxClient.QueryAPI(h.Org)
+	result, err := queryAPI.Query(context.Background(), query)
+	if err != nil {
+		log.Printf("Error querying data: %v", err)
+		return nil, err
+	}
+
+	var records []map[string]interface{}
+	for result.Next() {
+		values := result.Record().Values()
+
+		// Extract only the fields we want in the final payload
+		record := make(map[string]interface{})
+		record["timestamp"] = values["_time"]
+		record["device_id"] = values["device_id"]
+
+		// Dynamically add aggregated fields (e.g., max_temperature, min_humidity, etc.)
+		for key, value := range values {
+			if helpers.IsInArray(strings.Split(key, "_")[0], supportedAggregations) {
+				record[key] = value
+			}
+			// if strings.HasPrefix(key, "max_") || strings.HasPrefix(key, "min_") || strings.HasPrefix(key, "mean_") || strings.HasPrefix(key, "sum_") {
+			// 	record[key] = value
+			// }
+		}
+
+		records = append(records, record)
+	}
+
+	if result.Err() != nil {
+		log.Printf("Query error: %v", result.Err())
+		return nil, result.Err()
+	}
+
+	return records, nil
 }
 
 func RegisterRoutes(router *gin.Engine, recordHandler *RecordHandler) {
